@@ -16,7 +16,7 @@
 //! ### Limitations
 //!
 //! - Unlike Zig, `edg::r!` does not have access to the scope in which it is invoked, as
-//! the closure in `edg::r!` is run as its own script.
+//!   the closure in `edg::r!` is run as its own script.
 //! - Unfortunately, as `serde` is not const, you cant have `const X: _ = edg::r! { .. }`.
 //! - Each block must be compiled sequentially.
 //!
@@ -38,39 +38,13 @@ extern crate proc_macro;
 
 use std::{
     collections::hash_map::DefaultHasher,
-    fs::OpenOptions,
     hash::{Hash, Hasher},
-    io::ErrorKind,
-    path::Path,
     process::Command,
 };
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
 use syn::{ExprClosure, ReturnType};
-
-fn lock(dir: &Path) {
-    loop {
-        // no create_new stable :(
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(dir.join("lock"))
-        {
-            Ok(_) => return,
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                std::hint::spin_loop();
-                continue;
-            }
-            Err(_) => panic!("unable to create lock"),
-        }
-    }
-}
-
-fn unlock(dir: &Path) {
-    std::fs::remove_file(dir.join("lock")).expect("unable to unlock");
-}
 
 #[proc_macro]
 /// Run a closure at compile time.
@@ -84,15 +58,19 @@ fn unlock(dir: &Path) {
 /// } };
 /// ```
 pub fn r(input: TokenStream) -> TokenStream {
-    let out_dir = std::env::current_dir().map_or("/tmp".into(), |p| p.join("target"));
+    let out_dir = std::env::current_dir().map_or("/tmp".into(), |p| {
+        p.join("target")
+            .exists()
+            .then(|| p.join("target"))
+            .unwrap_or(p)
+    });
     macro_rules! err {
         ($fstr:literal$(,)? $( $arg:expr ),*) => {{
-            unlock(&out_dir);
             let compile_error = format!($fstr, $($arg),*);
             return TokenStream::from(quote!(compile_error!(#compile_error)));
         }};
     }
-    lock(&out_dir);
+    // lock(&out_dir);
 
     let args: Vec<_> = std::env::args().collect();
 
@@ -119,14 +97,15 @@ pub fn r(input: TokenStream) -> TokenStream {
                     let ser = serde_json::to_string(&res).expect("serialization failed");
                     print!("{{ser}}");
                 }}"#,
-            ty.to_token_stream().to_string()
+            ty.to_token_stream()
         ),
     )
     .expect("could not write file");
 
+	let out = format!("edg_{hash}");
     let mut rustc = Command::new("rustc");
     rustc.args(filter_rustc_args(&args));
-    rustc.args(["--crate-name", "edg_bin"]);
+    rustc.args(["--crate-name", &*out]);
     rustc.args(["--crate-type", "bin"]);
     rustc.args(["--out-dir".as_ref(), out_dir.as_os_str()]);
     rustc.args(merge_externs(&args));
@@ -147,7 +126,7 @@ pub fn r(input: TokenStream) -> TokenStream {
         .find(|a| a.starts_with("extra-filename="))
         .map(|ef| ef.split('=').nth(1).unwrap())
         .unwrap_or_default();
-    let out = out_dir.join(format!("edg_bin{extra}"));
+    let out = out_dir.join(format!("{out}{extra}"));
 
     let comptime_output = Command::new(&out)
         .output()
@@ -169,7 +148,7 @@ pub fn r(input: TokenStream) -> TokenStream {
     _ = std::fs::remove_file(file);
     _ = std::fs::remove_file(out);
 
-    unlock(&out_dir);
+    // unlock(&out_dir);
 
     quote!(::serde_json::from_str::<#ty>(#comptime_expr).expect(&format!("deser of expr ({}) failed (bug in `Deserialize` impl)", #comptime_expr))).into()
 }
@@ -185,7 +164,7 @@ fn filter_rustc_args(args: &[String]) -> Vec<&str> {
             skip = false;
             continue;
         }
-        if arg == "--crate-type" || arg == "--crate-name" || arg == "--extern" || arg == "-o" {
+        if arg == "--crate-type" || arg == "--crate-name" || arg == "--extern" || arg == "--out-dir" || arg == "-o" {
             skip = true;
         } else if arg.ends_with(".rs")
             || arg == "--test"
